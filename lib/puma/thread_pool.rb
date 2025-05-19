@@ -85,6 +85,18 @@ module Puma
       end
     end
 
+    # generate stats hash so as not to perform multiple locks
+    # @return [Hash] hash containing stat info from ThreadPool
+    def stats
+      with_mutex do
+        { backlog: @todo.size,
+          running: @spawned,
+          pool_capacity: @waiting + (@max - @spawned),
+          busy_threads: @spawned - @waiting + @todo.size
+        }
+      end
+    end
+
     # How many objects have yet to be processed by the pool?
     #
     def backlog
@@ -358,12 +370,12 @@ module Puma
     end
 
     def auto_trim!(timeout=@auto_trim_time)
-      @auto_trim = Automaton.new(self, timeout, "#{@name} threadpool trimmer", :trim)
+      @auto_trim = Automaton.new(self, timeout, "#{@name} tp trim", :trim)
       @auto_trim.start!
     end
 
     def auto_reap!(timeout=@reaping_time)
-      @reaper = Automaton.new(self, timeout, "#{@name} threadpool reaper", :reap)
+      @reaper = Automaton.new(self, timeout, "#{@name} tp reap", :reap)
       @reaper.start!
     end
 

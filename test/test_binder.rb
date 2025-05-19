@@ -8,7 +8,7 @@ require "puma/binder"
 require "puma/events"
 require "puma/configuration"
 
-class TestBinderBase < Minitest::Test
+class TestBinderBase < PumaTest
   include SSLHelper if ::Puma::HAS_SSL
   include TmpPath
 
@@ -77,6 +77,20 @@ class TestBinderParallel < TestBinderBase
 
     expected = ['tcp://0.0.0.0:3000', 'ssl://192.0.2.100:5000', 'ssl://192.0.2.101:5000?no_tlsv1=true', 'unix:///run/puma.sock', 'tcp://0.0.0.0:5000']
     assert_equal expected, result
+  end
+
+  def test_runs_before_parse_hooks
+    mock = Minitest::Mock.new
+    proc = -> { mock.call }
+
+    @binder.before_parse(&proc)
+
+    mock.expect(:call, nil)
+
+    @binder.parse ["tcp://localhost:0"]
+
+    assert_mock mock
+    assert_equal @binder.instance_variable_get(:@before_parse), [proc]
   end
 
   def test_localhost_addresses_dont_alter_listeners_for_tcp_addresses

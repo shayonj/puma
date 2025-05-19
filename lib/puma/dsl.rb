@@ -47,6 +47,7 @@ module Puma
   #     | on_worker_boot     | :before_worker_boot     | inside, before      |
   #     | on_worker_shutdown | :before_worker_shutdown | inside, after       |
   #     | on_refork          | :before_refork          | inside              |
+  #     | after_refork       | :after_refork           | inside              |
   #
   class DSL
     ON_WORKER_KEY = [String, Symbol].freeze
@@ -438,8 +439,7 @@ module Puma
     #   end
     #
     def on_restart(&block)
-      @options[:on_restart] ||= []
-      @options[:on_restart] << block
+      process_hook :on_restart, nil, block, 'on_restart'
     end
 
     # Command to use to restart Puma. This should be just how to
@@ -654,8 +654,6 @@ module Puma
     # @example
     #   state_permission 0600
     #
-    # @version 5.0.0
-    #
     def state_permission(permission)
       @options[:state_permission] = permission
     end
@@ -731,8 +729,7 @@ module Puma
     def before_fork(&block)
       warn_if_in_single_mode('before_fork')
 
-      @options[:before_fork] ||= []
-      @options[:before_fork] << block
+      process_hook :before_fork, nil, block, 'before_fork'
     end
 
     # Code to run in a worker when it boots to setup
@@ -754,7 +751,8 @@ module Puma
     end
 
     # Code to run immediately before a worker shuts
-    # down (after it has finished processing HTTP requests). These hooks
+    # down (after it has finished processing HTTP requests). The worker's
+    # index is passed as an argument. These hooks
     # can block if necessary to wait for background operations unknown
     # to Puma to finish before the process terminates.
     #
@@ -811,7 +809,7 @@ module Puma
 
     alias_method :after_worker_boot, :after_worker_fork
 
-    # Code to run after puma is booted (works for both: single and clustered)
+    # Code to run after puma is booted (works for both single and cluster modes).
     #
     # @example
     #   on_booted do
@@ -822,7 +820,7 @@ module Puma
       @config.options[:events].on_booted(&block)
     end
 
-    # Code to run after puma is stopped (works for both: single and clustered)
+    # Code to run after puma is stopped (works for both single and cluster modes).
     #
     # @example
     #   on_stopped do
@@ -851,10 +849,31 @@ module Puma
     #     3.times {GC.start}
     #   end
     #
-    # @version 5.0.0
-    #
     def on_refork(key = nil, &block)
+      warn_if_in_single_mode('on_refork')
+
       process_hook :before_refork, key, block, 'on_refork'
+    end
+
+    # When `fork_worker` is enabled, code to run in Worker 0
+    # after all other workers are re-forked from this process,
+    # after the server has temporarily stopped serving requests
+    # (once per complete refork cycle).
+    #
+    # This can be used to re-open any connections to remote servers
+    # (database, Redis, ...) that were closed via on_refork.
+    #
+    # This can be called multiple times to add several hooks.
+    #
+    # @note Cluster mode with `fork_worker` enabled only.
+    #
+    # @example
+    #   after_refork do
+    #     puts 'After refork...'
+    #   end
+    #
+    def after_refork(key = nil, &block)
+      process_hook :after_refork, key, block, 'after_refork'
     end
 
     # Provide a block to be executed just before a thread is added to the thread
@@ -875,8 +894,7 @@ module Puma
     #   end
     #
     def on_thread_start(&block)
-      @options[:before_thread_start] ||= []
-      @options[:before_thread_start] << block
+      process_hook :before_thread_start, nil, block, 'on_thread_start'
     end
 
     # Provide a block to be executed after a thread is trimmed from the thread
@@ -900,8 +918,7 @@ module Puma
     #   end
     #
     def on_thread_exit(&block)
-      @options[:before_thread_exit] ||= []
-      @options[:before_thread_exit] << block
+      process_hook :before_thread_exit, nil, block, 'on_thread_exit'
     end
 
     # Code to run out-of-band when the worker is idle.
@@ -1090,7 +1107,7 @@ module Puma
 
     # Set the timeout for worker shutdown.
     #
-    # The default is 60 seconds.
+    # The default is 30 seconds.
     #
     # @note Cluster mode only.
     #
@@ -1173,8 +1190,6 @@ module Puma
     # @see Puma::Server#handle_servers
     # @see Puma::ThreadPool#wait_for_less_busy_worker
     #
-    # @version 5.0.0
-    #
     def wait_for_less_busy_worker(val=0.005)
       @options[:wait_for_less_busy_worker] = val.to_f
     end
@@ -1248,9 +1263,8 @@ module Puma
     # A refork will automatically trigger once after the specified number of requests
     # (default 1000), or pass 0 to disable auto refork.
     #
+    # @note This is experimental.
     # @note Cluster mode only.
-    #
-    # @version 5.0.0
     #
     def fork_worker(after_requests=1000)
       @options[:fork_worker] = Integer(after_requests)
@@ -1266,6 +1280,32 @@ module Puma
     #
     def max_fast_inline(num_of_requests)
       @options[:max_fast_inline] = Float(num_of_requests)
+    end
+
+    # When `true`, keep-alive connections are maintained on inbound requests.
+    # Enabling this setting reduces the number of TCP operations, reducing response
+    # times for connections that can send multiple requests in a single connection.
+    #
+    # When Puma receives more incoming connections than available Puma threads,
+    # enabling the keep-alive behavior may result in processing requests out-of-order,
+    # increasing overall response time variance. Increased response time variance
+    # means that the overall average of response times might not change, but more
+    # outliers will exist. Those long-tail outliers may significantly affect response
+    # times for some processed requests.
+    #
+    # When `false`, Puma closes the connection after each request, requiring the
+    # client to open a new request. Disabling this setting guarantees that requests
+    # will be processed in the order they are fully received, decreasing response
+    # variance and eliminating long-tail outliers caused by keep-alive behavior.
+    # The trade-off is that the number of TCP operations required will increase.
+    #
+    # The default is +true+.
+    #
+    # @example
+    #   enable_keep_alives false
+    #
+    def enable_keep_alives(enabled=true)
+      @options[:enable_keep_alives] = enabled
     end
 
     # Specify the backend for the IO selector.
@@ -1388,8 +1428,8 @@ module Puma
       if workers_val == 0
         log_string =
           "Warning: You specified code to run in a `#{hook_name}` block, " \
-          "but Puma is not configured to run in cluster mode (worker count > 0 ), " \
-          "so your `#{hook_name}` block did not run"
+          "but Puma is not configured to run in cluster mode (worker count > 0), " \
+          "so your `#{hook_name}` block will not run."
 
         LogWriter.stdio.log(log_string)
       end

@@ -5,9 +5,7 @@ require_relative "helper"
 require "puma/app/status"
 require "rack"
 
-class TestAppStatus < Minitest::Test
-  parallelize_me!
-
+class TestAppStatus < PumaTest
   class FakeServer
     def initialize
       @status = :running
@@ -51,6 +49,14 @@ class TestAppStatus < Minitest::Test
     @app.instance_variable_set(:@auth_token, "abcdef")
 
     status, _, _ = lint('/whatever?token=abcdef')
+
+    assert_equal 404, status
+  end
+
+  def test_multiple_params
+    @app.instance_variable_set(:@auth_token, "abcdef")
+
+    status, _, _ = lint('/whatever?foo=bar&token=abcdef')
 
     assert_equal 404, status
   end

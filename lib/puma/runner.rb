@@ -8,6 +8,9 @@ module Puma
   # serve requests. This class spawns a new instance of `Puma::Server` via
   # a call to `start_server`.
   class Runner
+
+    include ::Puma::Const::PipeRequest
+
     def initialize(launcher)
       @launcher = launcher
       @log_writer = launcher.log_writer
@@ -27,7 +30,7 @@ module Puma
     def wakeup!
       return unless @wakeup
 
-      @wakeup.write Puma::Const::PipeRequest::WAKEUP unless @wakeup.closed?
+      @wakeup.write PIPE_WAKEUP unless @wakeup.closed?
 
     rescue SystemCallError, IOError
       Puma::Util.purge_interrupt_queue
@@ -91,7 +94,10 @@ module Puma
     end
 
     # @!attribute [r] ruby_engine
+    # @deprecated Use `RUBY_DESCRIPTION` instead
     def ruby_engine
+      warn "Puma::Runner#ruby_engine is deprecated; use RUBY_DESCRIPTION instead. It will be removed in puma v7."
+
       if !defined?(RUBY_ENGINE) || RUBY_ENGINE == "ruby"
         "ruby #{RUBY_VERSION}-p#{RUBY_PATCHLEVEL}"
       else
@@ -109,7 +115,8 @@ module Puma
       environment = @options[:environment]
 
       log "Puma starting in #{mode} mode..."
-      log "* Puma version: #{Puma::Const::PUMA_VERSION} (#{ruby_engine}) (\"#{Puma::Const::CODE_NAME}\")"
+      log "* Puma version: #{Puma::Const::PUMA_VERSION} (\"#{Puma::Const::CODE_NAME}\")"
+      log "* Ruby version: #{RUBY_DESCRIPTION}"
       log "*  Min threads: #{min_t}"
       log "*  Max threads: #{max_t}"
       log "*  Environment: #{environment}"

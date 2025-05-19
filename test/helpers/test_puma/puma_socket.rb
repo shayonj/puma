@@ -68,6 +68,8 @@ module TestPuma
     NO_ENTITY_BODY = Puma::STATUS_WITH_NO_ENTITY_BODY
     EMPTY_200 = [200, {}, ['']]
 
+    HAS_APPEND_AS_BYTES = ::String.new.respond_to? :append_as_bytes
+
     UTF8 = ::Encoding::UTF_8
 
     SET_TCP_NODELAY = Socket.const_defined?(:IPPROTO_TCP) && ::Socket.const_defined?(:TCP_NODELAY)
@@ -236,14 +238,22 @@ module TestPuma
             end
             if no_body && part.end_with?(RESP_SPLIT)
               response.times = times
-              return response << part
+              if HAS_APPEND_AS_BYTES
+                return response.append_as_bytes(part)
+              else
+                return response << part.b
+              end
             end
 
             unless content_length || chunked
               chunked ||= part.downcase.include? "\r\ntransfer-encoding: chunked\r\n"
               content_length = (t = part[/^Content-Length: (\d+)/i , 1]) ? t.to_i : nil
             end
-            response << part
+            if HAS_APPEND_AS_BYTES
+              response.append_as_bytes part
+            else
+              response << part.b
+            end
             hdrs, body = response.split RESP_SPLIT, 2
             unless body.nil?
               # below could be simplified, but allows for debugging...
@@ -326,6 +336,7 @@ module TestPuma
       skt.define_singleton_method :read_response, READ_RESPONSE
       skt.define_singleton_method :read_body, READ_BODY
       skt.define_singleton_method :<<, REQ_WRITE
+      skt.define_singleton_method :req_write, REQ_WRITE # used for chaining
       @ios_to_close << skt
       if ctx
         @ios_to_close << tcp
@@ -392,12 +403,12 @@ module TestPuma
                 results[idx] = body_only ? skt.read_body : skt.read_response
               end
             rescue StandardError => e
-              results[idx] = e.class.to_s
+              results[idx] = e.class
             end
             begin
               skt.close unless skt.closed? # skt.close may return Errno::EBADF
             rescue StandardError => e
-              results[idx] ||= e.class.to_s
+              results[idx] ||= e.class
             end
             skts[idx] = nil
           end

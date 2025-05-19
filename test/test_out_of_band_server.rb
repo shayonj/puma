@@ -1,6 +1,6 @@
 require_relative "helper"
 
-class TestOutOfBandServer < Minitest::Test
+class TestOutOfBandServer < PumaTest
   parallelize_me!
 
   def setup

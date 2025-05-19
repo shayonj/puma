@@ -2,20 +2,22 @@ require_relative "helper"
 require_relative "helpers/integration"
 
 class TestIntegrationSingle < TestIntegration
-  parallelize_me! if ::Puma.mri?
+  parallelize_me! if ::Puma::IS_MRI
 
   def workers ; 0 ; end
 
   def test_hot_restart_does_not_drop_connections_threads
     ttl_reqs = Puma.windows? ? 500 : 1_000
-    hot_restart_does_not_drop_connections num_threads: 5, total_requests: ttl_reqs
+    restart_does_not_drop_connections num_threads: 5, total_requests: ttl_reqs,
+      signal: :USR2
   end
 
   def test_hot_restart_does_not_drop_connections
     if Puma.windows?
-      hot_restart_does_not_drop_connections total_requests: 300
+      restart_does_not_drop_connections total_requests: 300,
+        signal: :USR2
     else
-      hot_restart_does_not_drop_connections
+      restart_does_not_drop_connections signal: :USR2
     end
   end
 
@@ -41,22 +43,29 @@ class TestIntegrationSingle < TestIntegration
 
   def test_term_exit_code
     skip_unless_signal_exist? :TERM
-    skip_if :jruby # JVM does not return correct exit code for TERM
 
     cli_server "test/rackup/hello.ru"
     _, status = stop_server
 
+    status = status.exitstatus % 128 if ::Puma::IS_JRUBY
     assert_equal 15, status
   end
 
   def test_on_booted_and_on_stopped
     skip_unless_signal_exist? :TERM
 
-    cli_server "-C test/config/event_on_booted_and_on_stopped.rb -C test/config/event_on_booted_exit.rb test/rackup/hello.ru",
-      no_wait: true
+    cli_server "test/rackup/hello.ru", no_wait: true, config: <<~CONFIG
+      on_booted  { STDOUT.syswrite "on_booted called\n"  }
+      on_stopped { STDOUT.syswrite "on_stopped called\n" }
+    CONFIG
 
     assert wait_for_server_to_include('on_booted called')
+
+    Process.kill :TERM, @pid
+
     assert wait_for_server_to_include('on_stopped called')
+
+    wait_server 15
   end
 
   def test_term_suppress
@@ -102,7 +111,6 @@ class TestIntegrationSingle < TestIntegration
 
   def test_term_not_accepts_new_connections
     skip_unless_signal_exist? :TERM
-    skip_if :jruby
 
     cli_server 'test/rackup/sleep.ru'
 
@@ -122,16 +130,13 @@ class TestIntegrationSingle < TestIntegration
     rejected_curl_wait_thread.join
 
     assert_match(/Slept 10/, curl_stdout.read)
-    assert_match(/Connection refused|Couldn't connect to server/, rejected_curl_stderr.read)
+    assert_match(/Connection refused|(Couldn't|Could not) connect to server/, rejected_curl_stderr.read)
 
-    Process.wait(@server.pid)
-    @server.close unless @server.closed?
-    @server = nil # prevent `#teardown` from killing already killed server
+    wait_server 15
   end
 
   def test_int_refuse
     skip_unless_signal_exist? :INT
-    skip_if :jruby  # seems to intermittently lockup JRuby CI
 
     cli_server 'test/rackup/hello.ru'
     begin
@@ -142,7 +147,7 @@ class TestIntegrationSingle < TestIntegration
     end
 
     Process.kill :INT, @pid
-    Process.wait @pid
+    wait_server
 
     assert_raises(Errno::ECONNREFUSED) { TCPSocket.new(HOST, @tcp_port) }
   end
@@ -207,10 +212,9 @@ class TestIntegrationSingle < TestIntegration
     cli_pumactl 'stop'
 
     assert wait_for_server_to_include("hello\n")
-    assert_includes @server.read, 'Goodbye!'
+    assert wait_for_server_to_include("Goodbye!")
 
-    @server.close unless @server.closed?
-    @server = nil
+    wait_server
   end
 
   # listener is closed 'externally' while Puma is in the IO.select statement
@@ -220,13 +224,9 @@ class TestIntegrationSingle < TestIntegration
     cli_server "test/rackup/close_listeners.ru", merge_err: true
     connection = fast_connect
 
-    if DARWIN && RUBY_VERSION < '2.5'
-      begin
-        read_body connection
-      rescue EOFError
-      end
-    else
+    begin
       read_body connection
+    rescue EOFError
     end
 
     begin
@@ -253,6 +253,8 @@ class TestIntegrationSingle < TestIntegration
     assert wait_for_server_to_include('Loaded Extensions:')
 
     cli_pumactl 'stop'
+    assert wait_for_server_to_include('Goodbye!')
+    wait_server
   end
 
   def test_idle_timeout

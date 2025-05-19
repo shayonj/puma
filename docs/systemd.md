@@ -72,7 +72,7 @@ systemd and Puma also support socket activation, where systemd opens the
 listening socket(s) in advance and provides them to the Puma master process on
 startup. Among other advantages, this keeps listening sockets open across puma
 restarts and achieves graceful restarts, including when upgraded Puma, and is
-compatible with both clustered mode and application preload.
+compatible with both cluster mode and application preload.
 
 **Note:** Any wrapper scripts which `exec`, or other indirections in `ExecStart`
 may result in activated socket file descriptors being closed before reaching the
@@ -240,6 +240,13 @@ stage=production # or different stage, as needed
 cap $stage puma:start --dry-run
 cap $stage puma:stop  --dry-run
 ~~~~
+
+### Disabling Puma Systemd Integration
+
+If you would like to disable Puma's systemd integration, for example if you handle it elsewhere
+in your code yourself, simply set the the environment variable `PUMA_SKIP_SYSTEMD` to any value.
+
+
 
 [Restart]: https://www.freedesktop.org/software/systemd/man/systemd.service.html#Restart=
 [#1367]: https://github.com/puma/puma/issues/1367

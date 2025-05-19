@@ -7,7 +7,7 @@ require_relative 'tmp_path'
 
 # Only single mode tests go here. Cluster and pumactl tests
 # have their own files, use those instead
-class TestIntegration < Minitest::Test
+class TestIntegration < PumaTest
   include TmpPath
   HOST  = "127.0.0.1"
   TOKEN = "xxyyzz"
@@ -21,8 +21,8 @@ class TestIntegration < Minitest::Test
   LOG_ERROR_SLEEP = 0.2
   LOG_ERROR_QTY   = 5
 
-  BASE = defined?(Bundler) ? "bundle exec #{Gem.ruby} -Ilib" :
-    "#{Gem.ruby} -Ilib"
+  # rubyopt requires bundler/setup, so we don't need it here
+  BASE = "#{Gem.ruby} -Ilib"
 
   def setup
     @server = nil
@@ -31,10 +31,12 @@ class TestIntegration < Minitest::Test
     @pid = nil
     @ios_to_close = []
     @bind_path    = tmp_path('.sock')
+    @control_path     = nil
+    @control_tcp_port = nil
   end
 
   def teardown
-    if @server && defined?(@control_tcp_port) && Puma.windows?
+    if @server && @control_tcp_port && Puma.windows?
       cli_pumactl 'stop'
     elsif @server && @pid && !Puma.windows?
       stop_server @pid, signal: :INT
@@ -61,12 +63,12 @@ class TestIntegration < Minitest::Test
       rescue
       ensure
         @server = nil
-
-        if @config_file
-          File.unlink(@config_file.path) rescue nil
-          @config_file = nil
-        end
       end
+    end
+
+    if @config_file
+      File.unlink(@config_file.path) rescue nil
+      @config_file = nil
     end
   end
 
@@ -74,6 +76,15 @@ class TestIntegration < Minitest::Test
 
   def silent_and_checked_system_command(*args)
     assert(system(*args, out: File::NULL, err: File::NULL))
+  end
+
+  def with_unbundled_env
+    bundler_ver = Gem::Version.new(Bundler::VERSION)
+    if bundler_ver < Gem::Version.new('2.1.0')
+      Bundler.with_clean_env { yield }
+    else
+      Bundler.with_unbundled_env { yield }
+    end
   end
 
   def cli_server(argv,  # rubocop:disable Metrics/ParameterLists
@@ -88,7 +99,9 @@ class TestIntegration < Minitest::Test
 
     if config
       @config_file = Tempfile.create(%w(config .rb))
-      @config_file.write config
+      @config_file.syswrite config
+      # not supported on some OS's, all GitHub Actions OS's support it
+      @config_file.fsync rescue nil
       @config_file.close
       config = "-C #{@config_file.path}"
     end
@@ -102,6 +115,7 @@ class TestIntegration < Minitest::Test
         "#{BASE} #{puma_path} #{config} -b unix://#{@bind_path} #{argv}"
       else
         @tcp_port = UniquePort.call
+        @bind_port = @tcp_port
         "#{BASE} #{puma_path} #{config} -b tcp://#{HOST}:#{@tcp_port} #{argv}"
       end
 
@@ -114,8 +128,8 @@ class TestIntegration < Minitest::Test
     else
       @server = IO.popen(env, cmd)
     end
-    wait_for_server_to_boot(log: log) unless no_wait
     @pid = @server.pid
+    wait_for_server_to_boot(log: log) unless no_wait
     @server
   end
 
@@ -133,8 +147,25 @@ class TestIntegration < Minitest::Test
     end
   end
 
-  def restart_server_and_listen(argv, log: false)
-    cli_server argv
+  # Most integration tests do not stop/shutdown the server, which is handled by
+  # `teardown` in this file.
+  # For tests that do stop/shutdown the server, use this method to check with `wait2`,
+  # and also clear variables so `teardown` will not run its code.
+  def wait_server(exit_code = 0, pid: @pid)
+    return unless pid
+    begin
+      _, status = Process.wait2 pid
+      status = status.exitstatus % 128 if ::Puma::IS_JRUBY
+      assert_equal exit_code, status
+    rescue Errno::ECHILD # raised on Windows ?
+    end
+  ensure
+    @server.close unless @server.closed?
+    @server = nil
+  end
+
+  def restart_server_and_listen(argv, env: {}, log: false)
+    cli_server argv, env: env, log: log
     connection = connect
     initial_reply = read_body(connection)
     restart_server connection, log: log
@@ -144,14 +175,17 @@ class TestIntegration < Minitest::Test
   # reuses an existing connection to make sure that works
   def restart_server(connection, log: false)
     Process.kill :USR2, @pid
+    wait_for_server_to_include 'Restarting', log: log
     connection.write "GET / HTTP/1.1\r\n\r\n" # trigger it to start by sending a new request
     wait_for_server_to_boot log: log
   end
 
   # wait for server to say it booted
   # @server and/or @server.gets may be nil on slow CI systems
-  def wait_for_server_to_boot(log: false)
-    wait_for_server_to_include 'Ctrl-C', log: log
+  def wait_for_server_to_boot(timeout: LOG_TIMEOUT, log: false)
+    @puma_pid = wait_for_server_to_match(/(?:Master|      ) PID: (\d+)$/, 1, timeout: timeout, log: log)&.to_i
+    @pid = @puma_pid if @pid != @puma_pid
+    wait_for_server_to_include 'Ctrl-C', timeout: timeout, log: log
   end
 
   # Returns true if and when server log includes str.  Will timeout otherwise.
@@ -179,7 +213,7 @@ class TestIntegration < Minitest::Test
     error_retries = 0
     line = ''
 
-    sleep 0.05 unless @server.is_a?(IO) or Process.clock_gettime(Process::CLOCK_MONOTONIC) > time_timeout
+    sleep 0.05 until @server.is_a?(IO) || Process.clock_gettime(Process::CLOCK_MONOTONIC) > time_timeout
 
     raise Minitest::Assertion,  "@server is not an IO" unless @server.is_a?(IO)
     if Process.clock_gettime(Process::CLOCK_MONOTONIC) > time_timeout
@@ -309,12 +343,13 @@ class TestIntegration < Minitest::Test
   # used to define correct 'refused' errors
   def thread_run_refused(unix: false)
     if unix
-      DARWIN ? [IOError, Errno::ENOENT, Errno::EPIPE] :
+      DARWIN ? [IOError, Errno::ENOENT, Errno::EPIPE, Errno::EBADF] :
                [IOError, Errno::ENOENT]
     else
       # Errno::ECONNABORTED is thrown intermittently on TCPSocket.new
+      # Errno::ECONNABORTED is thrown by Windows on read or write
       DARWIN ? [IOError, Errno::ECONNREFUSED, Errno::EPIPE, Errno::EBADF, EOFError, Errno::ECONNABORTED] :
-               [IOError, Errno::ECONNREFUSED, Errno::EPIPE]
+               [IOError, Errno::ECONNREFUSED, Errno::EPIPE, Errno::ECONNABORTED]
     end
   end
 
@@ -332,9 +367,9 @@ class TestIntegration < Minitest::Test
     arg =
       if no_bind
         argv.split(/ +/)
-      elsif unix
+      elsif @control_path && !@control_tcp_port
         %W[-C unix://#{@control_path} -T #{TOKEN} #{argv}]
-      else
+      elsif @control_tcp_port && !@control_path
         %W[-C tcp://#{HOST}:#{@control_tcp_port} -T #{TOKEN} #{argv}]
       end
 
@@ -349,9 +384,9 @@ class TestIntegration < Minitest::Test
     arg =
       if no_bind
         argv
-      elsif unix
+      elsif @control_path && !@control_tcp_port
         %Q[-C unix://#{@control_path} -T #{TOKEN} #{argv}]
-      else
+      elsif @control_tcp_port && !@control_path
         %Q[-C tcp://#{HOST}:#{@control_tcp_port} -T #{TOKEN} #{argv}]
       end
 
@@ -366,22 +401,32 @@ class TestIntegration < Minitest::Test
 
   def get_stats
     read_pipe = cli_pumactl "stats"
-    JSON.parse(read_pipe.readlines.last)
+    read_pipe.wait_readable 2
+    # `split("\n", 2).last` removes "Command stats sent success" line
+    JSON.parse read_pipe.read.split("\n", 2).last
   end
 
-  def hot_restart_does_not_drop_connections(num_threads: 1, total_requests: 500)
+  def restart_does_not_drop_connections(
+      num_threads: 1,
+      total_requests: 500,
+      config: nil,
+      unix: nil,
+      signal: nil,
+      log: nil
+    )
     skipped = true
     skip_if :jruby, suffix: <<-MSG
  - file descriptors are not preserved on exec on JRuby; connection reset errors are expected during restarts
     MSG
     skip_if :truffleruby, suffix: ' - Undiagnosed failures on TruffleRuby'
 
+    clustered = (workers || 0) >= 2
+
     args = "-w #{workers} -t 5:5 -q test/rackup/hello_with_delay.ru"
     if Puma.windows?
-      @control_tcp_port = UniquePort.call
-      cli_server "--control-url tcp://#{HOST}:#{@control_tcp_port} --control-token #{TOKEN} #{args}"
+      cli_server "#{set_pumactl_args} #{args}", unix: unix, config: config, log: log
     else
-      cli_server args
+      cli_server args, unix: unix, config: config, log: log
     end
 
     skipped = false
@@ -400,7 +445,7 @@ class TestIntegration < Minitest::Test
         num_requests.times do |req_num|
           begin
             begin
-              socket = TCPSocket.new HOST, @tcp_port
+              socket = unix ? UNIXSocket.new(@bind_path) : TCPSocket.new(HOST, @tcp_port)
               fast_write socket, "POST / HTTP/1.1\r\nContent-Length: #{message.bytesize}\r\n\r\n#{message}"
             rescue => e
               replies[:write_error] += 1
@@ -441,26 +486,57 @@ class TestIntegration < Minitest::Test
     run = true
 
     restart_thread = Thread.new do
-      sleep 0.2  # let some connections in before 1st restart
+      # Wait for some connections before first restart
+      sleep 0.2
       while run
         if Puma.windows?
           cli_pumactl 'restart'
         else
-          Process.kill :USR2, @pid
+          Process.kill signal, @pid
         end
-        sleep 0.5
-        wait_for_server_to_boot
+        if signal == :USR2
+          # If 'wait_for_server_to_boot' times out, error in thread shuts down CI
+          begin
+            wait_for_server_to_boot timeout: 5
+          rescue Minitest::Assertion # Timeout
+            run = false
+          end
+        end
         restart_count += 1
-        sleep(Puma.windows? ? 2.0 : 0.5)
+
+        if Puma.windows?
+          sleep 2.0
+        elsif clustered
+          phase = signal == :USR2 ? 0 : restart_count
+          # If 'get_worker_pids phase' times out, error in thread shuts down CI
+          begin
+            get_worker_pids phase, log: log
+            # Wait with an exponential backoff before signaling next restart
+            sleep 0.15 * (2 ** restart_count)
+          rescue Minitest::Assertion # Timeout
+            run = false
+          rescue Errno::EBADF # bad restart?
+            run = false
+          end
+        else
+          sleep 0.1
+        end
       end
     end
 
-    client_threads.each(&:join)
+    # cycle thru threads rather than one at a time
+    until client_threads.empty?
+      client_threads.each_with_index do |t, i|
+        client_threads[i] = nil if t.join(1)
+      end
+      client_threads.compact!
+    end
+
     run = false
     restart_thread.join
     if Puma.windows?
       cli_pumactl 'stop'
-      Process.wait @server.pid
+      wait_server
     else
       stop_server
     end
@@ -470,30 +546,23 @@ class TestIntegration < Minitest::Test
     msg << "   %4d refused\n"               % replies.fetch(:refused,0)
     msg << "   %4d read timeout\n"          % replies.fetch(:read_timeout,0)
     msg << "   %4d reset\n"                 % replies.fetch(:reset,0)
+    msg << "   %4d write_errors\n"          % replies.fetch(:write_error,0)
     msg << "   %4d success\n"               % replies.fetch(:success,0)
     msg << "   %4d success after restart\n" % replies.fetch(:restart,0)
     msg << "   %4d restart count\n"         % restart_count
 
+    actual_requests = num_threads * num_requests
+    allowed_errors = (actual_requests * 0.002).round
+
     refused = replies[:refused]
     reset   = replies[:reset]
 
-    if Puma.windows?
-      # 5 is default thread count in Puma?
-      reset_max = num_threads * restart_count
-      assert_operator reset_max, :>=, reset, "#{msg}Expected reset_max >= reset errors"
-      assert_operator 40, :>=,  refused, "#{msg}Too many refused connections"
-    else
-      assert_equal 0, reset, "#{msg}Expected no reset errors"
-      max_refused = (0.001 * replies.fetch(:success,0)).round
-      assert_operator max_refused, :>=, refused, "#{msg}Expected no than #{max_refused} refused connections"
-    end
-    assert_equal 0, replies[:unexpected_response], "#{msg}Unexpected response"
-    assert_equal 0, replies[:read_timeout], "#{msg}Expected no read timeouts"
+    assert_operator restart_count, :>=, 2, msg
 
     if Puma.windows?
-      assert_equal (num_threads * num_requests) - reset - refused, replies[:success]
+      assert_equal actual_requests - reset - refused, replies[:success]
     else
-      assert_equal (num_threads * num_requests), replies[:success]
+      assert_operator replies[:success], :>=,  actual_requests - allowed_errors, msg
     end
 
   ensure

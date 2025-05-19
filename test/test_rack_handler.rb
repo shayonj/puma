@@ -6,7 +6,12 @@ module TestRackUp
   require "rack/handler/puma"
   require "puma/events"
 
-  class TestOnBootedHandler < Minitest::Test
+  begin
+    require 'rackup/version'
+  rescue LoadError
+  end
+
+  class TestOnBootedHandler < PumaTest
     def app
       Proc.new {|env| @input = env; [200, {}, ["hello world"]]}
     end
@@ -22,7 +27,7 @@ module TestRackUp
 
       launcher = nil
       thread = Thread.new do
-        Rack::Handler::Puma.run(app, events: events, Verbose: true, Silent: true) do |l|
+        Rack::Handler::Puma.run(app, events: events, Verbose: true, Silent: true, Port: 0) do |l|
           launcher = l
         end
       end
@@ -40,7 +45,7 @@ module TestRackUp
     end
   end
 
-  class TestPathHandler < Minitest::Test
+  class TestPathHandler < PumaTest
     def app
       Proc.new {|env| @input = env; [200, {}, ["hello world"]]}
     end
@@ -83,7 +88,7 @@ module TestRackUp
     end
   end
 
-  class TestUserSuppliedOptionsPortIsSet < Minitest::Test
+  class TestUserSuppliedOptionsPortIsSet < PumaTest
     def setup
       @options = {}
       @options[:user_supplied_options] = [:Port]
@@ -108,7 +113,7 @@ module TestRackUp
     end
   end
 
-  class TestUserSuppliedOptionsHostIsSet < Minitest::Test
+  class TestUserSuppliedOptionsHostIsSet < PumaTest
     def setup
       @options = {}
       @options[:user_supplied_options] = [:Host]
@@ -133,9 +138,41 @@ module TestRackUp
 
       assert_equal ["tcp://[::1]:9292"], conf.options[:binds]
     end
+
+    def test_ssl_host_supplied_port_default
+      @options[:Host] = "ssl://127.0.0.1"
+      conf = ::Rack::Handler::Puma.config(->{}, @options)
+      conf.load
+
+      assert_equal ["ssl://127.0.0.1:9292"], conf.options[:binds]
+    end
+
+    def test_relative_unix_host
+      @options[:Host] = "./relative.sock"
+      conf = ::Rack::Handler::Puma.config(->{}, @options)
+      conf.load
+
+      assert_equal ["unix://./relative.sock"], conf.options[:binds]
+    end
+
+    def test_absolute_unix_host
+      @options[:Host] = "/absolute.sock"
+      conf = ::Rack::Handler::Puma.config(->{}, @options)
+      conf.load
+
+      assert_equal ["unix:///absolute.sock"], conf.options[:binds]
+    end
+
+    def test_abstract_unix_host
+      @options[:Host] = "@abstract.sock"
+      conf = ::Rack::Handler::Puma.config(->{}, @options)
+      conf.load
+
+      assert_equal ["unix://@abstract.sock"], conf.options[:binds]
+    end
   end
 
-  class TestUserSuppliedOptionsIsEmpty < Minitest::Test
+  class TestUserSuppliedOptionsIsEmpty < PumaTest
     def setup
       @options = {}
       @options[:user_supplied_options] = []
@@ -198,7 +235,7 @@ module TestRackUp
     end
   end
 
-  class TestUserSuppliedOptionsIsNotPresent < Minitest::Test
+  class TestUserSuppliedOptionsIsNotPresent < PumaTest
     def setup
       @options = {}
     end
@@ -299,7 +336,7 @@ module TestRackUp
   end
 
   # Run using IO.popen so we don't load Rack and/or Rackup in the main process
-  class RackUp < Minitest::Test
+  class RackUp < PumaTest
     def setup
       FileUtils.copy_file 'test/rackup/hello.ru', 'config.ru'
     end
@@ -328,5 +365,25 @@ module TestRackUp
         end
       end
     end
+
+    def test_rackup1
+      pid = nil
+      # JRuby & TruffleRuby take a long time using IO.popen
+      skip_unless :mri
+      env = {'RUBYOPT' => '-rbundler/setup -rrack/version -rrack/handler -rrackup -rrack/handler/puma'}
+      io = IO.popen env, "ruby -e 'puts Rackup::VERSION'"
+      io.wait_readable 2
+      pid = io.pid
+      log = io.sysread 2_048
+      assert_start_with log, '1.0'
+    ensure
+      if pid
+        if Puma::IS_WINDOWS
+          `taskkill /F /PID #{pid}`
+        else
+          `kill -s KILL #{pid}`
+        end
+      end
+    end if Object.const_defined?(:Rackup) && ::Rackup::VERSION.start_with?('1.')
   end
 end

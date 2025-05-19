@@ -100,8 +100,8 @@ module Puma
   # too taxing on performance.
   module Const
 
-    PUMA_VERSION = VERSION = "6.4.2"
-    CODE_NAME = "The Eagle of Durango"
+    PUMA_VERSION = VERSION = "6.6.0"
+    CODE_NAME = "Return to Forever"
 
     PUMA_SERVER_STRING = ["puma", PUMA_VERSION, CODE_NAME].join(" ").freeze
 
@@ -137,7 +137,7 @@ module Puma
     }.freeze
 
     # The basic max request size we'll try to read.
-    CHUNK_SIZE = 16 * 1024
+    CHUNK_SIZE = 64 * 1024
 
     # This is the maximum header that is allowed before a client is booted.  The parser detects
     # this, but we'd also like to do this as well.
@@ -281,19 +281,28 @@ module Puma
     # header values can contain HTAB?
     ILLEGAL_HEADER_VALUE_REGEX = /[\x00-\x08\x0A-\x1F]/.freeze
 
+    # The keys of headers that should not be convert to underscore
+    # normalized versions. These headers are ignored at the request reading layer,
+    # but if we normalize them after reading, it's just confusing for the application.
+    UNMASKABLE_HEADERS = {
+      "HTTP_TRANSFER,ENCODING" => true,
+      "HTTP_CONTENT,LENGTH" => true,
+    }
+
     # Banned keys of response header
     BANNED_HEADER_KEY = /\A(rack\.|status\z)/.freeze
 
     PROXY_PROTOCOL_V1_REGEX = /^PROXY (?:TCP4|TCP6|UNKNOWN) ([^\r]+)\r\n/.freeze
 
+    # All constants are prefixed with `PIPE_` to avoid name collisions.
     module PipeRequest
-      WAKEUP = "!"
-      BOOT = "b"
-      FORK = "f"
-      EXTERNAL_TERM = "e"
-      TERM = "t"
-      PING = "p"
-      IDLE = "i"
+      PIPE_WAKEUP = "!"
+      PIPE_BOOT = "b"
+      PIPE_FORK = "f"
+      PIPE_EXTERNAL_TERM = "e"
+      PIPE_TERM = "t"
+      PIPE_PING = "p"
+      PIPE_IDLE = "i"
     end
   end
 end

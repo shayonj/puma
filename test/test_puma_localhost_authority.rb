@@ -11,7 +11,7 @@ if ::Puma::HAS_SSL && !Puma::IS_JRUBY
   require "openssl" unless Object.const_defined? :OpenSSL
 end
 
-class TestPumaLocalhostAuthority < Minitest::Test
+class TestPumaLocalhostAuthority < PumaTest
   include TestPuma
   include TestPuma::PumaSocket
 
@@ -45,7 +45,7 @@ class TestPumaLocalhostAuthority < Minitest::Test
 
 end if ::Puma::HAS_SSL && !Puma::IS_JRUBY
 
-class TestPumaSSLLocalhostAuthority < Minitest::Test
+class TestPumaSSLLocalhostAuthority < PumaTest
   include TestPuma
   include TestPuma::PumaSocket
 

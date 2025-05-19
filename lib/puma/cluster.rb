@@ -44,10 +44,15 @@ module Puma
       end
     end
 
-    def start_phased_restart
+    def start_phased_restart(refork = false)
       @events.fire_on_restart!
+
       @phase += 1
-      log "- Starting phased worker restart, phase: #{@phase}"
+      if refork
+        log "- Starting worker refork, phase: #{@phase}"
+      else
+        log "- Starting phased worker restart, phase: #{@phase}"
+      end
 
       # Be sure to change the directory again before loading
       # the app. This way we can pick up new code.
@@ -87,6 +92,10 @@ module Puma
 
       if @options[:fork_worker] && all_workers_in_phase?
         @fork_writer << "0\n"
+
+        if worker_at(0).phase > 0
+          @fork_writer << "-2\n"
+        end
       end
     end
 
@@ -162,7 +171,7 @@ module Puma
       (@workers.map(&:pid) - idle_timed_out_worker_pids).empty?
     end
 
-    def check_workers
+    def check_workers(refork = false)
       return if @next_check >= Time.now
 
       @next_check = Time.now + @options[:worker_check_interval]
@@ -180,7 +189,12 @@ module Puma
         w = @workers.find { |x| x.phase != @phase }
 
         if w
-          log "- Stopping #{w.pid} for phased upgrade..."
+          if refork
+            log "- Stopping #{w.pid} for refork..."
+          else
+            log "- Stopping #{w.pid} for phased upgrade..."
+          end
+
           unless w.term?
             w.term
             log "- #{w.signal} sent to #{w.pid}..."
@@ -224,7 +238,7 @@ module Puma
     def phased_restart(refork = false)
       return false if @options[:preload_app] && !refork
 
-      @phased_restart = true
+      @phased_restart = refork ? :refork : true
       wakeup!
 
       true
@@ -364,7 +378,7 @@ module Puma
 
         before = Thread.list.reject(&fork_safe)
 
-        log "*     Restarts: (\u2714) hot (\u2716) phased"
+        log "*     Restarts: (\u2714) hot (\u2716) phased (#{@options[:fork_worker] ? "\u2714" : "\u2716"}) refork"
         log "* Preloading application"
         load_and_bind
 
@@ -382,7 +396,7 @@ module Puma
           end
         end
       else
-        log "*     Restarts: (\u2714) hot (\u2714) phased"
+        log "*     Restarts: (\u2714) hot (\u2714) phased (#{@options[:fork_worker] ? "\u2714" : "\u2716"}) refork"
 
         unless @config.app_configured?
           error "No application configured, nothing to run"
@@ -444,19 +458,23 @@ module Puma
             end
 
             if @phased_restart
-              start_phased_restart
+              start_phased_restart(@phased_restart == :refork)
+
+              in_phased_restart = @phased_restart
               @phased_restart = false
-              in_phased_restart = true
+
               workers_not_booted = @options[:workers]
+              # worker 0 is not restarted on refork
+              workers_not_booted -= 1 if in_phased_restart == :refork
             end
 
-            check_workers
+            check_workers(in_phased_restart == :refork)
 
             if read.wait_readable([0, @next_check - Time.now].max)
               req = read.read_nonblock(1)
               next unless req
 
-              if req == Puma::Const::PipeRequest::WAKEUP
+              if req == PIPE_WAKEUP
                 @next_check = Time.now
                 next
               end
@@ -464,7 +482,7 @@ module Puma
               result = read.gets
               pid = result.to_i
 
-              if req == Puma::Const::PipeRequest::BOOT || req == Puma::Const::PipeRequest::FORK
+              if req == PIPE_BOOT || req == PIPE_FORK
                 pid, idx = result.split(':').map(&:to_i)
                 w = worker_at idx
                 w.pid = pid if w.pid.nil?
@@ -472,22 +490,22 @@ module Puma
 
               if w = @workers.find { |x| x.pid == pid }
                 case req
-                when Puma::Const::PipeRequest::BOOT
+                when PIPE_BOOT
                   w.boot!
                   log "- Worker #{w.index} (PID: #{pid}) booted in #{w.uptime.round(2)}s, phase: #{w.phase}"
                   @next_check = Time.now
                   workers_not_booted -= 1
-                when Puma::Const::PipeRequest::EXTERNAL_TERM
+                when PIPE_EXTERNAL_TERM
                   # external term, see worker method, Signal.trap "SIGTERM"
                   w.term!
-                when Puma::Const::PipeRequest::TERM
+                when PIPE_TERM
                   w.term unless w.term?
-                when Puma::Const::PipeRequest::PING
+                when PIPE_PING
                   status = result.sub(/^\d+/,'').chomp
                   w.ping!(status)
                   @events.fire(:ping!, w)
 
-                  if in_phased_restart && workers_not_booted.positive? && w0 = worker_at(0)
+                  if in_phased_restart && @options[:fork_worker] && workers_not_booted.positive? && w0 = worker_at(0)
                     w0.ping!(status)
                     @events.fire(:ping!, w0)
                   end
@@ -497,7 +515,7 @@ module Puma
                     debug_loaded_extensions("Loaded Extensions - master:") if @log_writer.debug?
                     booted = true
                   end
-                when Puma::Const::PipeRequest::IDLE
+                when PIPE_IDLE
                   if idle_workers[pid]
                     idle_workers.delete pid
                   else

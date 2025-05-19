@@ -3,7 +3,7 @@ require "puma/events"
 require "net/http"
 require "nio"
 
-class TestResponseHeader < Minitest::Test
+class TestResponseHeader < PumaTest
   parallelize_me!
 
   # this file has limited response length, so 10kB works.
